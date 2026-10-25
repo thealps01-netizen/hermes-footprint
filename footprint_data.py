@@ -169,6 +169,12 @@ def entry_stat(e: os.DirEntry) -> os.stat_result:
     return s if s.st_dev else os.stat(e.path, follow_symlinks=False)
 
 
+def is_link(s: os.stat_result) -> bool:
+    """A symlink, or on Windows any reparse point: a junction reports as a folder, and walking it
+    would count space outside ~/.hermes (or the same folders again, for a junction back inside)."""
+    return st.S_ISLNK(s.st_mode) or bool(getattr(s, "st_file_attributes", 0) & getattr(st, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
 class Walker:
     """dust's shape, single-threaded: walk once, aggregate bottom-up, dedupe hardlinks."""
 
@@ -192,8 +198,8 @@ class Walker:
                 except OSError:
                     continue
                 if st.S_ISDIR(s.st_mode):
-                    if s.st_dev != self.dev or os.path.ismount(e.path):
-                        continue  # never enter another filesystem
+                    if s.st_dev != self.dev or is_link(s) or os.path.ismount(e.path):
+                        continue  # never enter another filesystem, a junction or a link
                     child = self.walk(e.path)
                     node["children"].append(child)
                     node["bytes"] += child["bytes"]; node["files"] += child["files"]
@@ -228,6 +234,24 @@ PACKAGE_NAMED = {"uv", "pip", "_cacache"}
 PACKAGE_FOLDERS = {"site-packages", "dist-packages", "node_modules"}
 
 
+def find_exe(name: str) -> str | None:
+    """A program on PATH. On Windows, never from the current folder: CreateProcess and
+    shutil.which look there first, so a planted git.exe would run instead."""
+    if not WINDOWS:
+        return shutil.which(name)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d and d != "." and os.path.isabs(d):
+            exe = os.path.join(d, name + ".exe")
+            if os.path.isfile(exe):
+                return exe
+    return None
+
+
+def windows_program(*rel: str) -> str:
+    """A program that ships with Windows, by its full path under %SystemRoot%."""
+    return os.path.join(os.environ.get("SystemRoot") or "C:\Windows", *rel)
+
+
 # Toolchains Hermes installs and expects to find (language servers, runtimes): not ours to offer.
 HERMES_MANAGED = re.compile(r"^(profiles/[^/]+/)?(lsp|tools|installs|bin)/")
 
@@ -238,8 +262,12 @@ def git_info(path: str | None) -> dict | None:
     if not path:
         return None
 
+    git = find_exe("git")
+    if not git:
+        return None
+
     def run(*args):
-        r = subprocess.run(["git", "--no-optional-locks", "-C", path, *args], capture_output=True,
+        r = subprocess.run([git, "--no-optional-locks", "-C", path, *args], capture_output=True,
                            text=True, timeout=30, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
         return r.stdout if r.returncode == 0 else None
     try:
@@ -263,10 +291,11 @@ def git_info(path: str | None) -> dict | None:
 
 
 def git_dirty(path: str | None) -> int:
-    if not path:
+    git = find_exe("git") if path else None
+    if not git:
         return 0
     try:
-        run = subprocess.run(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"],
+        run = subprocess.run([git, "--no-optional-locks", "-C", path, "status", "--porcelain"],
                              capture_output=True, text=True, timeout=20,
                              env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
         return len([l for l in run.stdout.splitlines() if l.strip()]) if run.returncode == 0 else 0
@@ -445,7 +474,7 @@ def du(path: str, dev: int, limit_s: float = 4.0) -> int | None:
                     except OSError:
                         continue
                     if st.S_ISDIR(s.st_mode):
-                        if s.st_dev == dev:
+                        if s.st_dev == dev and not is_link(s):
                             stack.append(e.path)
                     else:
                         if s.st_nlink > 1:
@@ -500,9 +529,7 @@ def trash_command(real: str) -> list | None:
     """The desktop's own 'move to trash' for this OS, as an argv list (never a shell string).
     Linux: gio or trash-cli. macOS: Finder. Windows: the Recycle Bin through .NET. None when no tool."""
     if WINDOWS:
-        ps = shutil.which("powershell") or shutil.which("pwsh")
-        if not ps:
-            return None
+        ps = windows_program("System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         kind = "DeleteDirectory" if os.path.isdir(real) else "DeleteFile"
         # The path reaches PowerShell as data (send_to_trash sets FOOTPRINT_TRASH_PATH), never as
         # script text: PowerShell also ends a '...' string at typographic quotes, so escaping ' is
@@ -640,7 +667,7 @@ def open_folder(path: str, root: Path | None = None) -> dict:
 
 def open_command(real: str) -> list | None:
     if WINDOWS:
-        return ["explorer", real]
+        return [windows_program("explorer.exe"), real]
     if MACOS:
         return ["open", real]
     if shutil.which("gio"):

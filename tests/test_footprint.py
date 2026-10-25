@@ -298,9 +298,40 @@ class FootprintTest(unittest.TestCase):
         self.assertIsNotNone(fd.recheck("~/.hermes/backups/b2", self.root))
         self.assertIsNotNone(fd.recheck("~/.hermes/cache/uv", self.root))
 
+    def test_windows_programs_never_come_from_the_current_folder(self):
+        """Windows looks for a bare program name in the current folder first (CreateProcess and
+        Python's shutil.which), so a planted explorer.exe, powershell.exe or git.exe there would run."""
+        here, on_path = Path(self.tmp.name) / "cwd", Path(self.tmp.name) / "bin"
+        for d in (here, on_path):
+            d.mkdir(); (d / "git.exe").write_bytes(b"")
+        windir = os.path.join("C:\\", "Windows")
+        cwd = os.getcwd(); os.chdir(here)
+        try:
+            with mock.patch.object(fd, "WINDOWS", True), mock.patch.object(fd, "MACOS", False), \
+                 mock.patch.dict(os.environ, {"SystemRoot": windir, "PATH": str(on_path)}):
+                self.assertEqual(fd.trash_command(str(self.root / "cache" / "uv"))[0],
+                                 os.path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"))
+                self.assertEqual(fd.open_command("C:\\x")[0], os.path.join(windir, "explorer.exe"))
+                self.assertEqual(fd.find_exe("git"), str(on_path / "git.exe"))
+            with mock.patch.object(fd, "WINDOWS", True), mock.patch.dict(os.environ, {"PATH": os.pathsep.join(["", "."])}):
+                self.assertIsNone(fd.find_exe("git"))   # only the one in the current folder: never used
+        finally:
+            os.chdir(cwd)
+
+    def test_scan_does_not_walk_into_links(self):
+        """A junction (Windows) or symlink to a folder elsewhere is not Hermes' space. The walk and
+        du() must not enter it, and a link back to ~/.hermes must not be walked again."""
+        dev = os.stat(self.root).st_dev
+        before, du_before = self.scan()["hermes"]["bytes"], fd.du(str(self.root), dev)
+        make(Path(self.tmp.name), "elsewhere/big.bin", 500_000)
+        self.link(self.root / "cache" / "linked", Path(self.tmp.name) / "elsewhere")
+        self.link(self.root / "cache" / "loop", self.root)
+        self.assertLess(self.scan()["hermes"]["bytes"] - before, 100_000)
+        self.assertLess(fd.du(str(self.root), dev, limit_s=30) - du_before, 100_000)
+
     def test_open_command_per_os_and_under(self):
         with mock.patch.object(fd, "WINDOWS", True), mock.patch.object(fd, "MACOS", False):
-            self.assertEqual(fd.open_command("C:\\x")[0], "explorer")
+            self.assertTrue(fd.open_command("C:\\x")[0].endswith("explorer.exe"))
         with mock.patch.object(fd, "WINDOWS", False), mock.patch.object(fd, "MACOS", True):
             self.assertEqual(fd.open_command("/x")[0], "open")
         self.assertTrue(fd.under(str(self.root / "cache" / "uv"), str(self.root)))
