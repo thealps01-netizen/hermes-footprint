@@ -84,7 +84,8 @@ KINDS = {
 # Never offered for removal, whatever the rules say: what a Bot needs to run.
 PROTECTED_NAMES = ["memories", "skills", "plugins", "desktop-plugins", "config.yaml", "auth.json", "auth.lock", ".env",
                    "profile.yaml", "SOUL.md", "cron", "hermes-agent"]
-PROTECTED = re.compile(r"(^|/)(state\.db[^/]*|" + "|".join(map(re.escape, PROTECTED_NAMES)) + r")(/|$)")
+# Case-insensitive: Windows and macOS treat SKILLS and skills as the same folder.
+PROTECTED = re.compile(r"(^|/)(state\.db[^/]*|" + "|".join(map(re.escape, PROTECTED_NAMES)) + r")(/|$)", re.IGNORECASE)
 
 
 def hermes_root() -> Path:
@@ -503,10 +504,12 @@ def trash_command(real: str) -> list | None:
         if not ps:
             return None
         kind = "DeleteDirectory" if os.path.isdir(real) else "DeleteFile"
-        quoted = real.replace("'", "''")
+        # The path reaches PowerShell as data (send_to_trash sets FOOTPRINT_TRASH_PATH), never as
+        # script text: PowerShell also ends a '...' string at typographic quotes, so escaping ' is
+        # not enough and a folder name could run code.
         return [ps, "-NoProfile", "-NonInteractive", "-Command",
-                "Add-Type -AssemblyName Microsoft.VisualBasic; "
-                f"[Microsoft.VisualBasic.FileIO.FileSystem]::{kind}('{quoted}', 'OnlyErrorDialogs', 'SendToRecycleBin')"]
+                "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; "
+                f"[Microsoft.VisualBasic.FileIO.FileSystem]::{kind}($env:FOOTPRINT_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')"]
     if MACOS:
         if not shutil.which("osascript"):
             return None
@@ -534,7 +537,7 @@ def send_to_trash(real: str) -> str | None:
     cmd = trash_command(real)
     if not cmd:
         return "no trash tool found (Linux: gio or trash-cli; macOS: osascript; Windows: PowerShell)"
-    run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env={**os.environ, "FOOTPRINT_TRASH_PATH": real})
     if run.returncode == 0:
         return None
     return (run.stderr.strip().splitlines() or run.stdout.strip().splitlines() or ["failed"])[-1]
@@ -548,11 +551,14 @@ def recheck(display: str, root: Path, now: float | None = None) -> dict | None:
     if not display.startswith("~/.hermes/"):
         return None
     rel = display[len("~/.hermes/"):]
-    if PROTECTED.search(rel):
-        return None
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") or "\\" in p for p in parts) or PROTECTED.search(rel):
+        return None  # only the '/'-joined form the scan itself produces
     real = real_path(display, root)
     if real == Path(root) or not under(str(real), str(root)) or not real.exists():
         return None
+    if os.path.normcase(os.path.realpath(real)) != os.path.normcase(os.path.join(os.path.realpath(root), *parts)):
+        return None  # a symlink or junction on the way leads somewhere else
     dev = os.stat(root).st_dev
     if real.is_dir():
         node = Walker(dev).walk(str(real))

@@ -237,7 +237,8 @@ class FootprintTest(unittest.TestCase):
              mock.patch.object(fd.os.path, "isdir", return_value=True):
             cmd = fd.trash_command("C:\\Users\\x\\.hermes\\cache\\it's")
             self.assertEqual(cmd[1:4], ["-NoProfile", "-NonInteractive", "-Command"])
-            self.assertIn("SendToRecycleBin", cmd[-1]); self.assertIn("DeleteDirectory", cmd[-1]); self.assertIn("it''s", cmd[-1])
+            self.assertIn("SendToRecycleBin", cmd[-1]); self.assertIn("DeleteDirectory", cmd[-1])
+            self.assertIn("$env:FOOTPRINT_TRASH_PATH", cmd[-1])
         with mock.patch.object(fd, "WINDOWS", False), mock.patch.object(fd, "MACOS", True), \
              mock.patch.object(fd.shutil, "which", return_value="/usr/bin/osascript"):
             cmd = fd.trash_command('/Users/x/.hermes/cache/a"b')
@@ -247,6 +248,55 @@ class FootprintTest(unittest.TestCase):
             self.assertEqual(fd.trash_command("/h/.hermes/cache/uv"), ["trash-put", "--", "/h/.hermes/cache/uv"])
         with mock.patch.object(fd, "WINDOWS", False), mock.patch.object(fd, "MACOS", False), mock.patch.object(fd.shutil, "which", return_value=None):
             self.assertIsNone(fd.trash_command("/h/.hermes/cache/uv"))
+
+    def test_windows_trash_path_is_never_part_of_the_script(self):
+        """PowerShell also ends a '...' string at the typographic quotes (U+2018-U+201B), so escaping
+        only ' let a folder name run code. The path must reach PowerShell as data, not as script."""
+        name = "C:\\h\\.hermes\\backups\\a\u2019); ni pwned; (\u2019 it's"
+        seen = []
+        with mock.patch.object(fd, "WINDOWS", True), mock.patch.object(fd, "MACOS", False), \
+             mock.patch.object(fd.shutil, "which", return_value="C:\\ps\\powershell.exe"), \
+             mock.patch.dict(sys.modules, {"send2trash": None}), \
+             mock.patch.object(fd.subprocess, "run", side_effect=lambda cmd, **k: seen.append((cmd, k)) or mock.Mock(returncode=0, stdout="", stderr="")):
+            self.assertIsNone(fd.send_to_trash(name))
+        (cmd, kw), = seen
+        self.assertFalse(any("\u2019" in a or "pwned" in a for a in cmd), cmd)
+        self.assertEqual(kw["env"]["FOOTPRINT_TRASH_PATH"], name)
+
+    @unittest.skipUnless(os.name == "nt" and os.environ.get("FOOTPRINT_REAL_TRASH"),
+                         "Windows only; set FOOTPRINT_REAL_TRASH=1 (moves a small test folder to the Recycle Bin)")
+    def test_windows_real_trash_runs_no_code_from_a_name(self):
+        evil = "a\u2019); ni INJECTED.txt; (\u2019"
+        make(self.root, f"backups/{evil}/f.txt", 10, OLD); os.utime(self.root / "backups" / evil, (OLD, OLD))
+        cwd = os.getcwd(); os.chdir(self.tmp.name)
+        try:
+            res = fd.trash([f"~/.hermes/backups/{evil}"], self.root)
+        finally:
+            os.chdir(cwd)
+        self.assertFalse((Path(self.tmp.name) / "INJECTED.txt").exists(), "the folder name ran as code")
+        self.assertTrue(res["results"][0]["ok"], res)
+        self.assertFalse((self.root / "backups" / evil).exists())
+
+    def link(self, link: Path, target: Path) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":   # a junction needs no admin rights, unlike a symlink
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+        else:
+            os.symlink(target, link)
+
+    def test_recheck_refuses_paths_the_scan_never_produces(self):
+        """The re-check must hold for any caller (REST, CLI), not only for paths the page sends:
+        no backslashes, '.', '..' or empty segments, no case games with protected names, and no
+        link or junction anywhere on the way."""
+        make(self.root, ".env", 100, OLD)
+        make(self.root, "skills/x/__pycache__/m.pyc", 100)
+        self.link(self.root / "cache" / "pip", Path(self.tmp.name) / "outside")
+        make(Path(self.tmp.name), "outside/secret.txt", 10)
+        for p in ["~/.hermes/backups/x\\..\\..\\.env", "~/.hermes/backups/b9/../b2", "~/.hermes/backups/./b2",
+                  "~/.hermes/backups//b2", "~/.hermes/SKILLS/x/__pycache__", "~/.hermes/cache/pip"]:
+            self.assertIsNone(fd.recheck(p, self.root), p)
+        self.assertIsNotNone(fd.recheck("~/.hermes/backups/b2", self.root))
+        self.assertIsNotNone(fd.recheck("~/.hermes/cache/uv", self.root))
 
     def test_open_command_per_os_and_under(self):
         with mock.patch.object(fd, "WINDOWS", True), mock.patch.object(fd, "MACOS", False):
