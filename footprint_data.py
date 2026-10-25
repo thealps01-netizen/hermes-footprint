@@ -249,7 +249,7 @@ def find_exe(name: str) -> str | None:
 
 def windows_program(*rel: str) -> str:
     """A program that ships with Windows, by its full path under %SystemRoot%."""
-    return os.path.join(os.environ.get("SystemRoot") or "C:\Windows", *rel)
+    return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", *rel)
 
 
 # Toolchains Hermes installs and expects to find (language servers, runtimes): not ours to offer.

@@ -298,6 +298,13 @@ class FootprintTest(unittest.TestCase):
         self.assertIsNotNone(fd.recheck("~/.hermes/backups/b2", self.root))
         self.assertIsNotNone(fd.recheck("~/.hermes/cache/uv", self.root))
 
+    def test_source_compiles_without_warnings(self):
+        """An invalid escape such as "C:\\Windows" in a normal string is a warning today and an error later."""
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile(Path(fd.__file__).read_text(encoding="utf-8"), fd.__file__, "exec")
+
     def test_windows_programs_never_come_from_the_current_folder(self):
         """Windows looks for a bare program name in the current folder first (CreateProcess and
         Python's shutil.which), so a planted explorer.exe, powershell.exe or git.exe there would run."""
