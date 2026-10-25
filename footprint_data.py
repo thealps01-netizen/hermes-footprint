@@ -160,6 +160,14 @@ def request_stop(root: Path | None = None) -> dict:
     return {"ok": True}
 
 
+def entry_stat(e: os.DirEntry) -> os.stat_result:
+    """``e.stat()`` without following links, with the device, inode and link count filled in.
+    Windows' DirEntry.stat() leaves those at 0, so a device check would skip every folder and
+    hardlinks could not be told apart; ``os.stat`` reports them."""
+    s = e.stat(follow_symlinks=False)
+    return s if s.st_dev else os.stat(e.path, follow_symlinks=False)
+
+
 class Walker:
     """dust's shape, single-threaded: walk once, aggregate bottom-up, dedupe hardlinks."""
 
@@ -179,7 +187,7 @@ class Walker:
         with it:
             for e in it:
                 try:
-                    s = e.stat(follow_symlinks=False)
+                    s = entry_stat(e)
                 except OSError:
                     continue
                 if st.S_ISDIR(s.st_mode):
@@ -213,6 +221,10 @@ REBUILDABLE = {
     "GPUCache": "browser cache: rebuilt when needed", "ShaderCache": "browser cache: rebuilt when needed",
     "Crashpad": "crash reports",
 }
+# Package caches that share their name with an installed package: pip and uv are also folders in
+# site-packages, so a folder with that name directly inside a package folder is code, not cache.
+PACKAGE_NAMED = {"uv", "pip", "_cacache"}
+PACKAGE_FOLDERS = {"site-packages", "dist-packages", "node_modules"}
 
 
 # Toolchains Hermes installs and expects to find (language servers, runtimes): not ours to offer.
@@ -270,9 +282,9 @@ def reclaim_reason(rel: str, node: dict, siblings: list, parent_rel: str, now: f
     sib = {s["name"] for s in siblings} | set(sib_files)
     if name == "node_modules" and "package.json" in sib and not HERMES_MANAGED.search(rel):
         return "reinstallable (npm install brings it back)"
-    if name in REBUILDABLE:
-        return REBUILDABLE[name]
     parent = os.path.basename(parent_rel)
+    if name in REBUILDABLE and not (name in PACKAGE_NAMED and parent in PACKAGE_FOLDERS):
+        return REBUILDABLE[name]
     if parent in ("backups", "profile-exports") or name.startswith("profiles-backup"):
         newest = sorted((s for s in siblings), key=lambda s: -s["mtime"])[:2]
         if age > BACKUP_AGE and node not in newest:
@@ -428,7 +440,7 @@ def du(path: str, dev: int, limit_s: float = 4.0) -> int | None:
             with os.scandir(d) as it:
                 for e in it:
                     try:
-                        s = e.stat(follow_symlinks=False)
+                        s = entry_stat(e)
                     except OSError:
                         continue
                     if st.S_ISDIR(s.st_mode):

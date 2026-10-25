@@ -15,6 +15,43 @@ fd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fd)
 
 OLD = time.time() - 90 * 86400
+REAL_SCANDIR = os.scandir
+
+
+class WindowsDirEntry:
+    """A DirEntry as Windows hands it out: stat() leaves st_ino, st_dev and st_nlink at 0
+    (https://docs.python.org/3/library/os.html#os.DirEntry.stat)."""
+
+    def __init__(self, entry):
+        self._e = entry
+        self.name, self.path = entry.name, entry.path
+
+    def stat(self, follow_symlinks=True):
+        s = self._e.stat(follow_symlinks=follow_symlinks)
+        return os.stat_result((s.st_mode, 0, 0, 0, s.st_uid, s.st_gid, s.st_size, s.st_atime, s.st_mtime, s.st_ctime))
+
+    def is_dir(self, follow_symlinks=True):
+        return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+    def is_file(self, follow_symlinks=True):
+        return self._e.is_file(follow_symlinks=follow_symlinks)
+
+
+class windows_scandir:
+    def __init__(self, path):
+        self._it = REAL_SCANDIR(path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._it.close()
+
+    def __iter__(self):
+        return (WindowsDirEntry(e) for e in self._it)
+
+    def close(self):
+        self._it.close()
 
 
 def make(root: Path, rel: str, size: int = 4096, mtime: float | None = None) -> Path:
@@ -133,7 +170,7 @@ class FootprintTest(unittest.TestCase):
             self.assertFalse(fd.open_folder("/etc", self.root)["ok"])
             self.assertFalse(fd.open_folder("~/.hermes/../../etc", self.root)["ok"])
         self.assertEqual(len(opened), 1)
-        self.assertTrue(opened[0][-1].endswith("/cache/uv"))
+        self.assertTrue(opened[0][-1].replace("\\", "/").endswith("/cache/uv"))
 
     def test_git_details_for_a_worktree(self):
         import subprocess
@@ -192,7 +229,7 @@ class FootprintTest(unittest.TestCase):
             st_size = 1234
         self.assertEqual(fd.alloc_bytes(WinStat()), 1234)
         real = os.stat(self.root / "state.db")
-        self.assertEqual(fd.alloc_bytes(real), real.st_blocks * 512)
+        self.assertEqual(fd.alloc_bytes(real), real.st_blocks * 512 if hasattr(real, "st_blocks") else real.st_size)
 
     def test_trash_command_per_os(self):
         with mock.patch.object(fd, "WINDOWS", True), mock.patch.object(fd, "MACOS", False), \
@@ -219,6 +256,35 @@ class FootprintTest(unittest.TestCase):
         self.assertTrue(fd.under(str(self.root / "cache" / "uv"), str(self.root)))
         self.assertFalse(fd.under("/etc", str(self.root)))
         self.assertFalse(fd.under(str(self.root) + "2", str(self.root)))  # a sibling that merely shares the prefix
+
+    def test_windows_direntry_without_device_ids(self):
+        """Windows' DirEntry.stat() reports st_dev 0, which never equals the root's device: the
+        walk must still enter subfolders, count a hardlink once, and size a Bot folder."""
+        expected_du = fd.du(str(self.root / "cache"), os.stat(self.root).st_dev)
+        with mock.patch.object(fd.os, "scandir", windows_scandir):
+            d = self.scan()
+            paths = {r["path"] for r in d["reclaimable"]}
+            self.assertIn("~/.hermes/cache/uv", paths)
+            self.assertIsNotNone(fd.recheck("~/.hermes/cache/uv", self.root))
+            skills = next(c for c in d["hermes"]["children"] if c["name"] == "skills")
+            self.assertLess(skills["bytes"], 2 * 40_000)
+            self.assertEqual(fd.du(str(self.root / "cache"), os.stat(self.root).st_dev), expected_du)
+        self.assertGreater(expected_du, 0)
+
+    def test_installed_pip_and_uv_are_not_caches(self):
+        """A folder named pip or uv inside site-packages is the installed package, not a cache."""
+        r = self.root
+        make(r, "tools/python-3.14/Lib/site-packages/pip/__init__.py", 50_000, OLD)
+        make(r, "tools/python-3.14/Lib/site-packages/uv/uv.exe", 50_000, OLD)
+        make(r, "web/venv/Lib/site-packages/pip/__init__.py", 50_000, OLD)
+        make(r, "cache/pip/http/x", 50_000)
+        paths = {x["path"] for x in self.scan()["reclaimable"]}
+        self.assertIn("~/.hermes/cache/pip", paths)                       # a real pip cache is still offered
+        for p in ("~/.hermes/tools/python-3.14/Lib/site-packages/pip",
+                  "~/.hermes/tools/python-3.14/Lib/site-packages/uv",
+                  "~/.hermes/web/venv/Lib/site-packages/pip"):
+            self.assertNotIn(p, paths)
+            self.assertIsNone(fd.recheck(p, self.root), p)
 
     def test_payload_has_no_private_fields(self):
         import json
